@@ -116,7 +116,10 @@ const Hero = () => {
         // Fallback to REST API if socket is not available
         try {
           console.log('Sending REST API request with:', { originalUrl: processedUrl });
-          const response = await fetch('http://localhost:3002/api/shorten', {
+          // Get API URL from context
+          const { getApiUrl } = useApp();
+          const apiUrl = getApiUrl();
+          const response = await fetch(`${apiUrl}/api/shorten`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',

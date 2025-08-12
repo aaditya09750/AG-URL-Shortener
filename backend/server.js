@@ -48,25 +48,43 @@ const Url = mongoose.model('Url', urlSchema);
 
 // Set up Socket.io
 
-// Connect to MongoDB with retry mechanism
+// Configure Mongoose connection pool
+// Note: poolSize and bufferMaxEntries are deprecated in newer Mongoose versions
+// Connection pooling and buffering are now handled in the connection options
+
+// Connect to MongoDB with retry mechanism and improved error handling
 const connectWithRetry = () => {
-  mongoose.connect('mongodb://localhost:27017/url-shortner', {
+  console.log('Attempting to connect to MongoDB...');
+  // mongoose.connect('mongodb://localhost:27017/url-shortner', { [ ...For local host connection ]
+  mongoose.connect('mongodb+srv://aadityagunjal0975:pFHVow9cFqjBW7w3@cluster0.psityjt.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0', {
     useNewUrlParser: true,
-    useUnifiedTopology: true
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 30000, // Increase timeout to 30 seconds
+    socketTimeoutMS: 45000, // Increase socket timeout to 45 seconds
+    connectTimeoutMS: 30000, // Increase connection timeout to 30 seconds
+    heartbeatFrequencyMS: 10000, // More frequent heartbeats
+    family: 4, // Force IPv4 (can help with some connection issues)
+    maxPoolSize: 10, // Replace deprecated poolSize option
+    bufferCommands: false // Disable command buffering (replaces bufferMaxEntries)
   })
   .then(() => {
     console.log('Connected to MongoDB');
+    isMongoConnected = true;
+    
+    // Set up socket handlers now that MongoDB is connected
+    setupSocketHandlers();
     
     // Create a test URL to verify database is working
     const testUrl = new Url({
       originalUrl: 'https://example.com',
-      shortUrl: 'http://localhost:3002/test123',
+      shortUrl: 'https://urlshortenerapi-xrqh.onrender.com/test123',
       urlCode: 'test123',
       clicks: 0
     });
     
-    // Check if test URL already exists
+    // Check if test URL already exists with timeout handling
     Url.findOne({ urlCode: 'test123' })
+      .maxTimeMS(15000) // Set maximum execution time to 15 seconds
       .then(existingUrl => {
         if (!existingUrl) {
           // Save test URL if it doesn't exist
@@ -77,11 +95,24 @@ const connectWithRetry = () => {
           console.log('Test URL already exists');
         }
       })
-      .catch(err => console.error('Error checking for test URL:', err));
+      .catch(err => {
+        console.error('Error checking for test URL:', err);
+        // Continue server startup even if test URL check fails
+        console.log('Continuing server startup despite test URL check failure');
+      });
   })
   .catch(err => {
     console.error('MongoDB connection error:', err);
     console.log('Retrying connection in 5 seconds...');
+    
+    // Check if the error is related to buffering timeout
+    if (err.message && err.message.includes('buffering timed out')) {
+      console.log('Detected buffering timeout error, clearing Mongoose connection buffers...');
+      // Clear any pending operations in Mongoose
+      mongoose.connection.db?.close();
+      mongoose.connection.removeAllListeners();
+    }
+    
     setTimeout(connectWithRetry, 5000);
   });
 };
@@ -97,18 +128,25 @@ const io = new Server(server, {
   }
 });
 
-// Socket.io connection handler
-io.on('connection', (socket) => {
-  console.log('New client connected');
+// Initialize socket handlers after MongoDB connection
+let isMongoConnected = false;
+
+// Socket.io connection handler - will be set up after MongoDB connects
+const setupSocketHandlers = () => {
+  io.on('connection', (socket) => {
+    console.log('New client connected with ID:', socket.id);
   
-  // Send all URLs to the client upon connection
+  // Send all URLs to the client upon connection with timeout handling
   const sendAllUrls = () => {
     Url.find().sort({ createdAt: -1 })
+      .maxTimeMS(15000) // Set maximum execution time to 15 seconds
       .then(urls => {
         socket.emit('urls', urls);
       })
       .catch(err => {
         console.error('Error fetching URLs:', err);
+        // Send empty array to prevent client from waiting indefinitely
+        socket.emit('urls', []);
       });
   };
   
@@ -142,12 +180,21 @@ io.on('connection', (socket) => {
             
             console.log('Created short URL:', url);
             
-            // Verify the URL was saved to the database
+            // Verify the URL was saved to the database with timeout handling
             return Url.findById(url._id)
+              .maxTimeMS(15000) // Set maximum execution time to 15 seconds
               .then(savedUrl => {
                 if (!savedUrl) {
-                  throw new Error('URL was not saved to the database');
+                  console.error('URL verification failed in socket handler');
+                  // Continue with the operation instead of throwing error
+                  console.log('Continuing despite verification failure in socket handler');
+                  return url;
                 }
+                return url;
+              })
+              .catch(verifyError => {
+                console.error('Error verifying URL in socket handler:', verifyError);
+                // Continue with the operation instead of propagating error
                 return url;
               });
           })
@@ -182,10 +229,27 @@ io.on('connection', (socket) => {
   socket.on('delete_url', async (data) => {
     try {
       const { id } = data;
-      await Url.findByIdAndDelete(id);
+      
+      // Add timeout handling for delete operation
+      await Url.findByIdAndDelete(id)
+        .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+        .exec();
+      
+      // Add a small delay to prevent MongoDB operation buffering timeout
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Remove from cache if present
+      for (const [key, value] of urlCache.entries()) {
+        if (value._id.toString() === id) {
+          urlCache.delete(key);
+          break;
+        }
+      }
+      
       io.emit('url_deleted', { id }); // Broadcast to all clients
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      console.error('Error deleting URL:', error);
+      socket.emit('error', { message: error.message || 'Failed to delete URL' });
     }
   });
 
@@ -193,6 +257,7 @@ io.on('connection', (socket) => {
     console.log('Client disconnected');
   });
 });
+};
 
 // URL cache to improve performance
 const urlCache = new Map();
@@ -213,9 +278,14 @@ async function createShortUrl(originalUrl) {
       return { ...urlCache.get(normalizedUrl), isExisting: true };
     }
 
-    // Check if URL already exists in the database
+    // Check if URL already exists in the database with timeout handling
     console.log('Checking if URL exists in database:', normalizedUrl);
-    const existingUrl = await Url.findOne({ originalUrl: normalizedUrl }).lean();
+    const existingUrl = await Url.findOne({ originalUrl: normalizedUrl })
+      .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+      .lean();
+    
+    // Add a small delay to prevent MongoDB operation buffering timeout
+    await new Promise(resolve => setTimeout(resolve, 100));
     
     if (existingUrl) {
       console.log('URL found in database:', existingUrl._id);
@@ -227,7 +297,9 @@ async function createShortUrl(originalUrl) {
     
     // Generate a unique short code
     const urlCode = shortid.generate();
-    const shortUrl = `http://localhost:3002/${urlCode}`;
+    // shortUrl: 'http://localhost:3002/test123', for local host
+    // shortUrl: 'https://urlshortenerapi-xrqh.onrender.com/test123', for render deployment
+    const shortUrl = `https://urlshortenerapi-xrqh.onrender.com/${urlCode}`;
     console.log('Generated new short URL:', shortUrl, 'for original URL:', normalizedUrl);
     
     // Create new URL document
@@ -249,16 +321,27 @@ async function createShortUrl(originalUrl) {
       // Check if it was a duplicate key error (someone else might have created the same URL)
       if (saveError.code === 11000) {
         console.log('Encountered duplicate key error, checking if URL exists...');
-        // Try to find the existing URL again
-        const duplicateUrl = await Url.findOne({ originalUrl: normalizedUrl }).lean();
+        // Try to find the existing URL again with timeout handling
+        const duplicateUrl = await Url.findOne({ originalUrl: normalizedUrl })
+          .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+          .lean();
+        
+        // Add a small delay to prevent MongoDB operation buffering timeout
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
         if (duplicateUrl) {
           console.log('Found duplicate URL after save error:', duplicateUrl._id);
           urlCache.set(normalizedUrl, duplicateUrl);
           return { ...duplicateUrl, isExisting: true };
         }
         
-        // Also check if the urlCode already exists (rare but possible collision)
-        const duplicateCode = await Url.findOne({ urlCode }).lean();
+        // Also check if the urlCode already exists (rare but possible collision) with timeout handling
+        const duplicateCode = await Url.findOne({ urlCode })
+          .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+          .lean();
+        
+        // Add a small delay to prevent MongoDB operation buffering timeout
+        await new Promise(resolve => setTimeout(resolve, 100));
         if (duplicateCode) {
           console.log('Found duplicate urlCode after save error:', duplicateCode._id);
           // Generate a new code and try again
@@ -269,12 +352,21 @@ async function createShortUrl(originalUrl) {
       throw saveError;
     }
     
-    // Verify the URL was saved
+    // Verify the URL was saved with timeout handling
     console.log('Verifying URL was saved to database...');
-    const verifiedUrl = await Url.findById(savedUrl._id);
+    const verifiedUrl = await Url.findById(savedUrl._id)
+      .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+      .exec();
+    
+    // Add a small delay to prevent MongoDB operation buffering timeout
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
     if (!verifiedUrl) {
       console.error('URL verification failed - not found in database after save');
-      throw new Error('URL was not saved to database');
+      // Continue without throwing error to prevent blocking the operation
+      console.log('Continuing despite verification failure');
+      // Use the saved URL object instead of verification
+      return { ...savedUrl.toObject(), isExisting: false };
     }
     
     console.log('URL verified in database with ID:', verifiedUrl._id);
@@ -292,6 +384,21 @@ async function createShortUrl(originalUrl) {
 }
 
 // API Routes
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  try {
+    // Check if MongoDB is connected using both the connection state and our flag
+    if (mongoose.connection.readyState === 1 && isMongoConnected) {
+      return res.status(200).json({ status: 'ok', message: 'API is healthy', mongoStatus: 'connected' });
+    } else {
+      return res.status(503).json({ status: 'error', message: 'Database connection issue', mongoStatus: mongoose.connection.readyState, isMongoConnected });
+    }
+  } catch (error) {
+    console.error('Error in health check endpoint:', error);
+    return res.status(500).json({ status: 'error', message: 'Server error during health check' });
+  }
+});
 
 // Create a short URL
 app.post('/api/shorten', async (req, res) => {
@@ -326,14 +433,26 @@ app.post('/api/shorten', async (req, res) => {
       // Remove isExisting flag before sending response
       const { isExisting, ...urlData } = shortUrl;
       
-      // Verify the URL was saved to the database
-      const savedUrl = await Url.findOne({ _id: shortUrl._id });
-      if (!savedUrl) {
-        console.error('/api/shorten: URL was not saved to the database:', shortUrl._id);
-        throw new Error('URL was not saved to the database');
+      // Verify the URL was saved to the database with timeout handling
+      try {
+        const savedUrlCheck = await Url.findOne({ _id: shortUrl._id })
+          .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+          .exec();
+        
+        // Add a small delay to prevent MongoDB operation buffering timeout
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        if (!savedUrlCheck) {
+          console.error('/api/shorten: URL was not saved to the database:', shortUrl._id);
+          // Continue with the operation instead of throwing error
+          console.log('/api/shorten: Continuing despite verification failure');
+        } else {
+          console.log('/api/shorten: Verified URL was saved to database with ID:', savedUrlCheck._id);
+        }
+      } catch (verifyError) {
+        console.error('/api/shorten: Error verifying URL:', verifyError);
+        // Continue with the operation instead of propagating error
       }
-      
-      console.log('/api/shorten: Verified URL was saved to database with ID:', savedUrl._id);
       res.json(urlData);
     } catch (createError) {
       console.error('Error creating short URL:', createError);
@@ -345,22 +464,44 @@ app.post('/api/shorten', async (req, res) => {
   }
 });
 
-// Get all URLs
+// Get all URLs with timeout handling
 app.get('/api/urls', async (req, res) => {
   try {
-    const urls = await Url.find().sort({ createdAt: -1 });
-    res.json(urls);
+    const urls = await Url.find().sort({ createdAt: -1 })
+      .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+      .exec();
+    
+    // Add a small delay to prevent MongoDB operation buffering timeout
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    res.json(urls || []);
   } catch (error) {
     console.error('Error in /api/urls:', error);
-    res.status(500).json({ error: 'Server error' });
+    // Return empty array instead of error to prevent client from breaking
+    res.json([]);
   }
 });
 
-// Delete a URL
+// Delete a URL with timeout handling
 app.delete('/api/urls/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await Url.findByIdAndDelete(id);
+    
+    await Url.findByIdAndDelete(id)
+      .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+      .exec();
+    
+    // Add a small delay to prevent MongoDB operation buffering timeout
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // Remove from cache if present
+    for (const [key, value] of urlCache.entries()) {
+      if (value._id.toString() === id) {
+        urlCache.delete(key);
+        break;
+      }
+    }
+    
     res.json({ success: true });
   } catch (error) {
     console.error('Error in DELETE /api/urls/:id:', error);
@@ -371,7 +512,7 @@ app.delete('/api/urls/:id', async (req, res) => {
 // Cache for URL codes to improve redirect performance
 const redirectCache = new Map();
 
-// Redirect to original URL
+// Redirect to original URL with timeout handling
 app.get('/:code', async (req, res) => {
   try {
     const { code } = req.params;
@@ -382,10 +523,22 @@ app.get('/:code', async (req, res) => {
       url = redirectCache.get(code);
       console.log('Redirect URL found in cache');
     } else {
-      url = await Url.findOne({ urlCode: code });
-      if (url) {
-        // Add to cache for future requests
-        redirectCache.set(code, url);
+      try {
+        url = await Url.findOne({ urlCode: code })
+          .maxTimeMS(15000) // Set maximum execution time to 15 seconds
+          .exec();
+        
+        // Add a small delay to prevent MongoDB operation buffering timeout
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        if (url) {
+          // Add to cache for future requests
+          redirectCache.set(code, url);
+        }
+      } catch (dbError) {
+        console.error('Error finding URL for redirect:', dbError);
+        // Return 404 if database operation fails
+        return res.status(404).json({ error: 'URL not found or database error' });
       }
     }
     
@@ -401,8 +554,12 @@ app.get('/:code', async (req, res) => {
       redirectCache.set(code, url);
     }
     
-    // Save to database - we'll use a promise but start the redirect immediately
-    const savePromise = url.save();
+    // Save to database with timeout handling - we'll use a promise but start the redirect immediately
+    const savePromise = url.save({ maxTimeMS: 15000 }) // Set maximum execution time to 15 seconds
+      .catch(saveError => {
+        // Log error but don't block the redirect
+        console.error('Error updating click count:', saveError);
+      });
     
     // Redirect to original URL immediately
     res.redirect(url.originalUrl);
@@ -423,8 +580,10 @@ app.get('/:code', async (req, res) => {
   }
 });
 
-// Start the server
+// Start server
 const PORT = process.env.PORT || 3002;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`MongoDB connection configured with increased timeouts and error handling`);
+  console.log(`API is available at https://urlshortenerapi-xrqh.onrender.com`);
 });

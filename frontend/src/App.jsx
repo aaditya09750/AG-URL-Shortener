@@ -5,6 +5,7 @@ import Hero from './components/Hero'
 import Results from './components/Results'
 import AdminPanel from './components/AdminPanel'
 import Footer from './components/Footer'
+import ErrorNotification from './components/ErrorNotification'
 import './App.css'
 
 function App() {
@@ -19,6 +20,7 @@ function App() {
           </main>
           <Footer />
           <AdminPanel />
+          <ErrorNotification />
         </div>
       </AppProvider>
     </ThemeProvider>
