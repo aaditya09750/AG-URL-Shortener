@@ -239,7 +239,7 @@ VITE_SOCKET_URL=https://your-api-domain.com
 **Backend (Server/Cloud)**
 ```env
 PORT=3002
-MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/url-shortener
+MONGODB_URI=...
 NODE_ENV=production
 CORS_ORIGIN=https://ag-url-shortener.netlify.app
 ```
